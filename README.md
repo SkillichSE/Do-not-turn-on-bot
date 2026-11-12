@@ -1,4 +1,4 @@
-# NII-fight-bot
+# NII fight bot named ["Do not turn on"](https://nii-site.vercel.app/robot-do-not-turn-on.html)
 
 Combat robot firmware for ESP32, controlled with a DualShock 4 gamepad over Bluetooth.
 
