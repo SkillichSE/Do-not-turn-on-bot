@@ -1,7 +1,6 @@
 # NII-fight-bot
 
 Combat robot firmware for ESP32, controlled with a DualShock 4 gamepad over Bluetooth.
-Based on an ESP-IDF + Arduino template by Ricardo Quesada, see LICENSE.
 
 > [!IMPORTANT]
 > Download the project **only with this command**. The libraries (arduino-esp32 and btstack) are git submodules, and without `--recursive` they will not be downloaded and the project will not build.
