@@ -1,90 +1,146 @@
 #include <Arduino.h>
 #include <Bluepad32.h>
 
-// Pins: each motor has one PWM pin (speed) and one DIR pin (direction)
-#define L_PWM   25
-#define L_DIR   26
-#define R_PWM   27
-#define R_DIR   14
-#define F_PWM   32
-#define F_DIR   33
-// Pins 34 and 35 are input-only, fine for an encoder
-#define ENC_A   34
-#define ENC_B   35
+// drive driver 1
+#define FL_IN1  25
+#define FL_IN2  26
+#define FR_IN1  27
+#define FR_IN2  14
+// drive driver 2
+#define RL_IN1  32
+#define RL_IN2  33
+#define RR_IN1  18
+#define RR_IN2  19
+
+// weapon driver
+#define W_RPWM  4
+#define W_LPWM  16
+
+// encoder and limit switch at bottom position
+#define ENC_A      21
+#define ENC_B      22
+#define LIMIT_PIN  13
+
 #define BUZZER  23
 #define LED     2
 
-// Stick idles around 4, so small values are ignored
 const int  DEADZONE         = 40;
-// Set to true if that motor spins the wrong way
-const bool INVERT_LEFT      = false;
-const bool INVERT_RIGHT     = false;
-const bool INVERT_FLIP      = false;
-// Set to true if encoder count goes down when the flipper lifts
+
+// set true if motor spins the wrong way
+const bool INVERT_FL        = false;
+const bool INVERT_FR        = false;
+const bool INVERT_RL        = false;
+const bool INVERT_RR        = false;
+const bool INVERT_WEAPON    = false;
 const bool ENC_INVERT       = false;
-// Encoder ticks from bottom to top, tune to the real flipper travel
-const long FLIP_UP_TICKS    = 300;
+
+// pwm cap for 12v motor on 22v pack
+const int  WEAPON_MAX_PWM   = 140;
+// encoder ticks from bottom to top 80 ticks per turn
+const long FLIP_UP_TICKS    = 80;
 const int  FLIP_SPEED       = 255;
-// Max time (ms) for one raise or lower, safety limit
+const int  HOME_SPEED       = 140;
 const uint32_t FLIP_TIMEOUT = 2000;
-// No encoder change for this long (ms) means the flipper has stopped
+const uint32_t HOME_TIMEOUT = 4000;
+// no encoder change for this long means weapon stopped
 const uint32_t STALL_MS     = 200;
-// Данные геймпада не менялись столько мс: считаем, что он заснул/завис, стоп
 const uint32_t DATA_TIMEOUT = 500;
-// Данные не менялись столько мс: геймпад мёртв, отключаем его и освобождаем слот
 const uint32_t DEAD_DISCONNECT_MS = 3000;
-// Пользователь ничего не трогал столько мс: отключаем геймпад (0 = выключено)
+// 0 disables idle disconnect
 const uint32_t IDLE_DISCONNECT_MS = 5UL * 60UL * 1000UL;
 
-// Encoder position. Zero = flipper down. Start with the flipper lowered
+// zero is weapon down
 volatile long encCount = 0;
+volatile uint8_t encPrev = 0;
+
+static const DRAM_ATTR int8_t ENC_TABLE[16] = {
+   0, -1,  1,  0,
+   1,  0,  0, -1,
+  -1,  0,  0,  1,
+   0,  1, -1,  0
+};
 
 void IRAM_ATTR encISR() {
-  int a = digitalRead(ENC_A);
-  int b = digitalRead(ENC_B);
-  long step = (a == b) ? 1 : -1;
+  uint8_t cur = (digitalRead(ENC_A) << 1) | digitalRead(ENC_B);
+  int8_t step = ENC_TABLE[(encPrev << 2) | cur];
+  encPrev = cur;
   if (ENC_INVERT) step = -step;
   encCount += step;
 }
 
 long getEnc() { return encCount; }
 
-// v is -255..255, sign sets direction
-void setMotor(int pwmPin, int dirPin, int v, bool invert) {
-  if (invert) v = -v;
-  v = constrain(v, -255, 255);
-  digitalWrite(dirPin, v >= 0 ? HIGH : LOW);
-  ledcWrite(pwmPin, abs(v));
+bool limitOn = false;
+uint32_t limitT = 0;
+bool homed = false;
+
+void limitUpdate() {
+  bool raw = digitalRead(LIMIT_PIN) == LOW;
+  uint32_t now = millis();
+  if (raw != limitOn && now - limitT > 15) {
+    limitOn = raw;
+    limitT = now;
+    if (limitOn) {
+      encCount = 0;
+      homed = true;
+    }
+  }
 }
 
-// thr = forward/back, turn = left/right, both -512..512
-// Left and right sides get different power to steer
+// v is -255 to 255
+void setMotor(int in1, int in2, int v, bool invert) {
+  if (invert) v = -v;
+  v = constrain(v, -255, 255);
+  if (v >= 0) {
+    ledcWrite(in1, v);
+    ledcWrite(in2, 0);
+  } else {
+    ledcWrite(in1, 0);
+    ledcWrite(in2, -v);
+  }
+}
+
+void setWeapon(int v) {
+  if (INVERT_WEAPON) v = -v;
+  v = constrain(v, -255, 255);
+  int duty = abs(v) * WEAPON_MAX_PWM / 255;
+  if (v >= 0) {
+    ledcWrite(W_RPWM, duty);
+    ledcWrite(W_LPWM, 0);
+  } else {
+    ledcWrite(W_RPWM, 0);
+    ledcWrite(W_LPWM, duty);
+  }
+}
+
+// thr and turn are -512 to 512
 void drive(int thr, int turn) {
-  int l = constrain(thr + turn, -512, 512);
-  int r = constrain(thr - turn, -512, 512);
-  setMotor(L_PWM, L_DIR, l * 255 / 512, INVERT_LEFT);
-  setMotor(R_PWM, R_DIR, r * 255 / 512, INVERT_RIGHT);
+  int l = constrain(thr + turn, -512, 512) * 255 / 512;
+  int r = constrain(thr - turn, -512, 512) * 255 / 512;
+  setMotor(FL_IN1, FL_IN2, l, INVERT_FL);
+  setMotor(RL_IN1, RL_IN2, l, INVERT_RL);
+  setMotor(FR_IN1, FR_IN2, r, INVERT_FR);
+  setMotor(RR_IN1, RR_IN2, r, INVERT_RR);
 }
 
 int applyDeadzone(int v) { return abs(v) < DEADZONE ? 0 : v; }
 
-// One X press: raise, then lower right away
-// Stops by target ticks, by encoder stall, or by timeout
-enum FlipState { F_IDLE, F_RAISE, F_LOWER };
+// home lowers to limit switch when zero is unknown
+enum FlipState { F_IDLE, F_HOME, F_RAISE, F_LOWER };
 FlipState fstate = F_IDLE;
 uint32_t fStart = 0, lastEncMs = 0;
 long lastEnc = 0;
 
 void flipperStart() {
   if (fstate != F_IDLE) return;
-  fstate = F_RAISE;
+  fstate = homed ? F_RAISE : F_HOME;
   fStart = millis();
   lastEnc = getEnc();
   lastEncMs = fStart;
 }
 
 void flipperStop() {
-  setMotor(F_PWM, F_DIR, 0, INVERT_FLIP);
+  setWeapon(0);
   fstate = F_IDLE;
 }
 
@@ -98,11 +154,16 @@ void flipperUpdate() {
 
   switch (fstate) {
     case F_IDLE:
-      setMotor(F_PWM, F_DIR, 0, INVERT_FLIP);
+      setWeapon(0);
+      break;
+
+    case F_HOME:
+      setWeapon(-HOME_SPEED);
+      if (limitOn || now - fStart > HOME_TIMEOUT) flipperStop();
       break;
 
     case F_RAISE:
-      setMotor(F_PWM, F_DIR, FLIP_SPEED, INVERT_FLIP);
+      setWeapon(FLIP_SPEED);
       if (pos >= FLIP_UP_TICKS || stalled || timeout) {
         fstate = F_LOWER;
         fStart = now;
@@ -112,16 +173,17 @@ void flipperUpdate() {
       break;
 
     case F_LOWER:
-      setMotor(F_PWM, F_DIR, -FLIP_SPEED, INVERT_FLIP);
-      if (pos <= 0 || stalled || timeout) {
-        if (stalled) encCount = 0;  // hit the bottom, reset zero
+      setWeapon(-FLIP_SPEED);
+      if (limitOn) {
+        flipperStop();
+      } else if (stalled || timeout) {
+        homed = false;
         flipperStop();
       }
       break;
   }
 }
 
-// Two short buzzer + LED pulses, same timing as the rumble
 bool fbActive = false;
 uint32_t fbStart = 0;
 
@@ -138,15 +200,13 @@ void feedbackUpdate() {
   digitalWrite(LED, on ? HIGH : LOW);
 }
 
-// Only one gamepad is used
 ControllerPtr gamepad = nullptr;
 bool rumbleDone = false;
 bool prevX = false;
 uint32_t lastDataMs = 0;
-uint32_t lastInputMs = 0;   // последнее действие пользователя
+uint32_t lastInputMs = 0;
 uint32_t lastHash = 0;
 
-// Хэш всего состояния: если он меняется, пакеты приходят
 uint32_t stateHash(ControllerPtr c) {
   uint32_t h = 2166136261u;
   auto mix = [&](int32_t v) { h = (h ^ (uint32_t)v) * 16777619u; };
@@ -159,7 +219,6 @@ uint32_t stateHash(ControllerPtr c) {
   return h;
 }
 
-// Пользователь реально что-то нажал/двинул стик
 bool userActive(ControllerPtr c) {
   return abs(c->axisX()) >= DEADZONE || abs(c->axisY()) >= DEADZONE ||
          abs(c->axisRX()) >= DEADZONE || abs(c->axisRY()) >= DEADZONE ||
@@ -191,7 +250,6 @@ void onConnectedController(ControllerPtr ctl) {
   }
 }
 
-// Gamepad lost: stop all motors
 void onDisconnectedController(ControllerPtr ctl) {
   if (gamepad == ctl) {
     Serial.println("Gamepad disconnected, stopping");
@@ -203,19 +261,28 @@ void onDisconnectedController(ControllerPtr ctl) {
 void setup() {
   Serial.begin(115200);
 
-  pinMode(L_DIR, OUTPUT);
-  pinMode(R_DIR, OUTPUT);
-  pinMode(F_DIR, OUTPUT);
   pinMode(BUZZER, OUTPUT);
   pinMode(LED, OUTPUT);
-  ledcAttach(L_PWM, 20000, 8);
-  ledcAttach(R_PWM, 20000, 8);
-  ledcAttach(F_PWM, 20000, 8);
+
+  const int pwmPins[] = {FL_IN1, FL_IN2, FR_IN1, FR_IN2,
+                         RL_IN1, RL_IN2, RR_IN1, RR_IN2,
+                         W_RPWM, W_LPWM};
+  for (int p : pwmPins) ledcAttach(p, 20000, 8);
   stopAll();
 
-  pinMode(ENC_A, INPUT);
-  pinMode(ENC_B, INPUT);
+  pinMode(ENC_A, INPUT_PULLUP);
+  pinMode(ENC_B, INPUT_PULLUP);
+  encPrev = (digitalRead(ENC_A) << 1) | digitalRead(ENC_B);
   attachInterrupt(digitalPinToInterrupt(ENC_A), encISR, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_B), encISR, CHANGE);
+
+  pinMode(LIMIT_PIN, INPUT_PULLUP);
+  limitOn = digitalRead(LIMIT_PIN) == LOW;
+  limitT = millis();
+  if (limitOn) {
+    encCount = 0;
+    homed = true;
+  }
 
   BP32.setup(&onConnectedController, &onDisconnectedController);
   BP32.enableVirtualDevice(false);
@@ -226,6 +293,7 @@ void setup() {
 void loop() {
   BP32.update();
   feedbackUpdate();
+  limitUpdate();
 
   bool alive = gamepad && gamepad->isConnected();
   uint32_t now = millis();
@@ -236,10 +304,8 @@ void loop() {
     if (userActive(gamepad)) lastInputMs = now;
   }
 
-  // Failsafe: нет геймпада, или данные замерли (сон/зависание), стоп
   if (!alive || now - lastDataMs > DATA_TIMEOUT) {
     stopAll();
-    // Геймпад "подключён", но молчит: отключаем, чтобы можно было переподключиться
     if (gamepad && now - lastDataMs > DEAD_DISCONNECT_MS) {
       Serial.println("Gamepad silent, dropping");
       dropGamepad();
@@ -248,7 +314,6 @@ void loop() {
     return;
   }
 
-  // Долгое бездействие: отключаем сами, пока геймпад не заснул
   if (IDLE_DISCONNECT_MS && now - lastInputMs > IDLE_DISCONNECT_MS) {
     Serial.println("Idle timeout, disconnecting gamepad");
     dropGamepad();
@@ -263,12 +328,12 @@ void loop() {
     rumbleDone = true;
   }
 
-  // Left stick. Up is negative Y, so it is flipped
+  // up is negative y
   int thr  = -applyDeadzone(gamepad->axisY());
   int turn =  applyDeadzone(gamepad->axisX());
   drive(thr, turn);
 
-  // a() is the X (Cross) button on DualShock 4
+  // a is the cross button on dualshock 4
   bool x = gamepad->a();
   if (x && !prevX) flipperStart();
   prevX = x;
