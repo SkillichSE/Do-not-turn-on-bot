@@ -34,16 +34,18 @@ const bool INVERT_RR        = false;
 const bool INVERT_WEAPON    = false;
 const bool ENC_INVERT       = false;
 
-// pwm cap for 12v motor on 22v pack
-const int  WEAPON_MAX_PWM   = 140;
+// pwm cap for 12v motor on 6s pack
+const int  WEAPON_MAX_PWM   = 120;
 // encoder ticks from bottom to top 80 ticks per turn
 const long FLIP_UP_TICKS    = 80;
 const int  FLIP_SPEED       = 255;
 const int  HOME_SPEED       = 140;
+// max command change per loop step for weapon ramp
+const int  WEAPON_RAMP_STEP = 12;
 const uint32_t FLIP_TIMEOUT = 2000;
 const uint32_t HOME_TIMEOUT = 4000;
 // no encoder change for this long means weapon stopped
-const uint32_t STALL_MS     = 200;
+const uint32_t STALL_MS     = 400;
 const uint32_t DATA_TIMEOUT = 500;
 const uint32_t DEAD_DISCONNECT_MS = 3000;
 // 0 disables idle disconnect
@@ -100,7 +102,9 @@ void setMotor(int in1, int in2, int v, bool invert) {
   }
 }
 
-void setWeapon(int v) {
+int weaponCmd = 0;
+
+void applyWeapon(int v) {
   if (INVERT_WEAPON) v = -v;
   v = constrain(v, -255, 255);
   int duty = abs(v) * WEAPON_MAX_PWM / 255;
@@ -111,6 +115,19 @@ void setWeapon(int v) {
     ledcWrite(W_RPWM, 0);
     ledcWrite(W_LPWM, duty);
   }
+}
+
+// target is ramped smoothly and zero stops at once
+void setWeapon(int target) {
+  target = constrain(target, -255, 255);
+  if (target == 0) {
+    weaponCmd = 0;
+  } else if (target > weaponCmd) {
+    weaponCmd = min(weaponCmd + WEAPON_RAMP_STEP, target);
+  } else {
+    weaponCmd = max(weaponCmd - WEAPON_RAMP_STEP, target);
+  }
+  applyWeapon(weaponCmd);
 }
 
 // thr and turn are -512 to 512
